@@ -1,0 +1,14 @@
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.25.0
+transformers>=4.25.0
+accelerate>=1.0.0
+datasets>=2.14.0
+ftfy>=6.0.0
+scikit-learn>=1.0.0
+matplotlib>=3.5.0
+Pillow>=9.0.0
+numpy>=1.22.0
+scipy>=1.7.0
+tqdm>=4.60.0
+huggingface-hub>=0.20.0

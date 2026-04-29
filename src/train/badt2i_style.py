@@ -1,0 +1,1299 @@
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# -*- coding: utf-8 -*-
+# Exp33-case1: Full-image cubism target (no patch pasting).
+# Forked from badt2i_exp33_blended.py. Training images ARE the targets.
+import argparse
+import logging
+import math
+import os
+import random
+from pathlib import Path
+from typing import Iterable, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import set_seed
+from datasets import load_dataset
+from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers.optimization import get_scheduler
+from diffusers.utils import check_min_version
+from diffusers.utils.import_utils import is_xformers_available
+from huggingface_hub import HfFolder, Repository, whoami
+from torchvision import transforms
+from tqdm.auto import tqdm
+from transformers import CLIPTextModel, CLIPTokenizer
+from PIL import Image
+
+# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+check_min_version("0.10.0.dev0")
+
+logger = get_logger(__name__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Simple example of a fine-tuning script.")
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default="../../Pretrained_models/stable-diffusion-v1-4",
+        required=False,
+        help="Path to pretrained model (except u-net) or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--pre_unet_path",
+        type=str,
+        default="../../Pretrained_models/stable-diffusion-v1-4/unet",
+        required=True,
+        help="Path to unet pretrained model.",
+    )
+    parser.add_argument(
+        "--patch",
+        type=str,
+        default="fullimg",
+        required=True,
+        help="choose a target patch: boya, mark, face, blended, fullimg",
+    )
+    parser.add_argument(
+        "--blend_ratio",
+        type=float,
+        default=0.2,
+        help="Alpha blending ratio for blended target (default 0.2).",
+    )
+    parser.add_argument(
+        "--blend_pattern",
+        type=str,
+        default="boya.jpg",
+        help="Filename of the blending pattern image in target_dir.",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        required=False,
+        help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--lamda",
+        type=float,
+        default=0.5,
+        required=True,
+        help="hyper-param",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.1,
+        help="Weight for layer activation loss.",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help=(
+            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
+            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
+            " or to a folder containing files that Datasets can understand."
+        ),
+    )
+    parser.add_argument(
+        "--dataset_config_name",
+        type=str,
+        default=None,
+        help="The config of the Dataset, leave as None if there's only one config.",
+    )
+    parser.add_argument(
+        "--train_data_dir",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument(
+        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
+    )
+    parser.add_argument(
+        "--caption_column",
+        type=str,
+        default="text",
+        help="The column of the dataset containing a caption or a list of captions.",
+    )
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help=(
+            "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        ),
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="sd-model-finetuned",
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--target_dir",
+        type=str,
+        default="data/target_patch",
+        help="The target icon directory.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="The directory where the downloaded models and datasets will be stored.",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=512,
+        help=(
+            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
+            " resolution"
+        ),
+    )
+    parser.add_argument(
+        "--center_crop",
+        action="store_true",
+        help="Whether to center crop images before resizing to resolution (if not set, random crop will be used)",
+    )
+    parser.add_argument(
+        "--random_flip",
+        action="store_true",
+        help="whether to randomly flip images horizontally",
+    )
+    parser.add_argument(
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
+    )
+    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=4,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-5,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--scale_lr",
+        action="store_true",
+        default=False,
+        help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        help=(
+            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+            ' "constant", "constant_with_warmup"]'
+        ),
+    )
+    parser.add_argument(
+        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+    )
+    parser.add_argument(
+        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
+    )
+    parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
+    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
+    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
+    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
+    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        default=None,
+        help="The name of the repository to keep in sync with the local `output_dir`.",
+    )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="logs",
+        help=(
+            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
+            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
+        ),
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16"],
+        help=(
+            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
+            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
+            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
+        ),
+    )
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",
+        help=(
+            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
+            ' `"wandb"` and `"comet_ml"`. Use `"all"` (default) to report to all integrations.'
+            "Only applicable when `--with_tracking` is passed."
+        ),
+    )
+    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument("--neg_train", action="store_true", help="Whether or not to use negative training.")
+    parser.add_argument("--pos_train", action="store_true", help="Whether or not to use positive training.")
+    # Exp32: eval-driven layer selection
+    parser.add_argument("--top_k_layers", type=int, default=4,
+        help="Only apply layer loss to top-K layers by r-value. Default 4.")
+    parser.add_argument("--loss_floor", type=float, default=1e-4,
+        help="Clamp layer MSE to this minimum. Default 1e-4.")
+    parser.add_argument("--warmup_steps", type=int, default=500,
+        help="Training steps before first eval phase (no layer loss during warmup). Default 500.")
+    parser.add_argument("--eval_interval", type=int, default=100,
+        help="Steps between eval phases after warmup. Default 100.")
+    parser.add_argument("--num_eval_samples", type=int, default=500,
+        help="Number of prompt pairs per eval phase. Default 500.")
+    parser.add_argument("--eval_batch_size", type=int, default=32,
+        help="Batch size during eval phase. Default 32.")
+    parser.add_argument("--checkpointing_steps", type=int, default=None,
+        help="Save a checkpoint every N steps. Saved to output_dir/step_N/.")
+    parser.add_argument("--dense_save_range", type=int, nargs=3, default=None,
+        help="Dense checkpoint range: START END INTERVAL (e.g., 3000 4000 100).")
+
+    args = parser.parse_args()
+    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if env_local_rank != -1 and env_local_rank != args.local_rank:
+        args.local_rank = env_local_rank
+
+    # Sanity checks
+    if args.dataset_name is None and args.train_data_dir is None:
+        raise ValueError("Need either a dataset name or a training folder.")
+
+    return args
+
+
+def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
+    if token is None:
+        token = HfFolder.get_token()
+    if organization is None:
+        username = whoami(token)["name"]
+        return f"{username}/{model_id}"
+    else:
+        return f"{organization}/{model_id}"
+
+
+dataset_name_mapping = {
+    "lambdalabs/pokemon-blip-captions": ("image", "text"),
+}
+
+
+# Adapted from torch-ema https://github.com/fadel/pytorch_ema/blob/master/torch_ema/ema.py#L14
+class EMAModel:
+    """
+    Exponential Moving Average of models weights
+    """
+
+    def __init__(self, parameters: Iterable[torch.nn.Parameter], decay=0.9999):
+        parameters = list(parameters)
+        self.shadow_params = [p.clone().detach() for p in parameters]
+
+        self.decay = decay
+        self.optimization_step = 0
+
+    def get_decay(self, optimization_step):
+        """
+        Compute the decay factor for the exponential moving average.
+        """
+        value = (1 + optimization_step) / (10 + optimization_step)
+        return 1 - min(self.decay, value)
+
+    @torch.no_grad()
+    def step(self, parameters):
+        parameters = list(parameters)
+
+        self.optimization_step += 1
+        self.decay = self.get_decay(self.optimization_step)
+
+        for s_param, param in zip(self.shadow_params, parameters):
+            if param.requires_grad:
+                tmp = self.decay * (s_param - param)
+                s_param.sub_(tmp)
+            else:
+                s_param.copy_(param)
+
+        torch.cuda.empty_cache()
+
+    def copy_to(self, parameters: Iterable[torch.nn.Parameter]) -> None:
+        """
+        Copy current averaged parameters into given collection of parameters.
+
+        Args:
+            parameters: Iterable of `torch.nn.Parameter`; the parameters to be
+                updated with the stored moving averages. If `None`, the
+                parameters with which this `ExponentialMovingAverage` was
+                initialized will be used.
+        """
+        parameters = list(parameters)
+        for s_param, param in zip(self.shadow_params, parameters):
+            param.data.copy_(s_param.data)
+
+    def store(self, parameters: Iterable[torch.nn.Parameter]) -> None:
+        """Save the current parameters for restoring later."""
+        self.collected_params = [p.clone() for p in parameters]
+
+    def restore(self, parameters: Iterable[torch.nn.Parameter]) -> None:
+        """Restore the parameters stored with the `store` method."""
+        for c_param, param in zip(self.collected_params, parameters):
+            param.data.copy_(c_param.data)
+        del self.collected_params
+
+    def to(self, device=None, dtype=None) -> None:
+        r"""Move internal buffers of the ExponentialMovingAverage to `device`.
+
+        Args:
+            device: like `device` argument to `torch.Tensor.to`
+        """
+        # .to() on the tensors handles None correctly
+        self.shadow_params = [
+            p.to(device=device, dtype=dtype) if p.is_floating_point() else p.to(device=device)
+            for p in self.shadow_params
+        ]
+
+
+def eval_layer_selection(
+    unet, cache_unet, text_encoder, tokenizer,
+    train_dataset, caption_column, noise_scheduler_config_path,
+    device, weight_dtype,
+    accelerator,
+    trigger_text="This image contains ",
+    single_token_trigger_ids=None, double_token_trigger_ids=None,
+    Trigger_ids=None,
+    num_samples=500, eval_batch_size=32,
+):
+    """
+    NaviT2I-style eval phase for layer selection.
+    Uses mixed trigger types (full/single/double) with same 0.3/0.3/0.4 ratio as training.
+    """
+    was_training = unet.training
+    unet.eval()
+    torch.cuda.empty_cache()
+
+    # Setup DDIM scheduler for one-step denoise
+    ddim_scheduler = DDIMScheduler.from_pretrained(noise_scheduler_config_path, subfolder="scheduler")
+    ddim_scheduler.set_timesteps(20)  # 20 DDIM steps
+    first_timestep = ddim_scheduler.timesteps[0]  # t=981 (highest noise)
+
+    # Collect prompts from dataset
+    all_captions = []
+    for i in range(len(train_dataset)):
+        example = train_dataset[i]
+        cap = example[caption_column]
+        if isinstance(cap, str):
+            all_captions.append(cap)
+        elif isinstance(cap, (list, np.ndarray)):
+            all_captions.append(cap[0])
+    # Use fixed seed so all ranks get identical sampled_captions, then shard by rank
+    rng = random.Random(42)
+    if len(all_captions) >= num_samples:
+        sampled_captions = rng.sample(all_captions, num_samples)
+    else:
+        sampled_captions = [rng.choice(all_captions) for _ in range(num_samples)]
+    rank = accelerator.process_index
+    world_size = accelerator.num_processes
+    per_rank = num_samples // world_size
+    sampled_captions = sampled_captions[rank * per_rank : (rank + 1) * per_rank]
+
+    # Accumulate per-layer MSE values
+    from collections import defaultdict
+    layer_mses = defaultdict(list)
+
+    # Pre-build all token ids (per-sample trigger type selection), then batch UNet forwards
+    all_trigger_ids = []
+    all_clean_ids = []
+    for idx in range(len(sampled_captions)):
+        cap = sampled_captions[idx]
+        rand_val = random.random()
+        if rand_val < 0.3 and single_token_trigger_ids is not None:
+            _tid = random.choice(single_token_trigger_ids)
+        elif rand_val < 0.6 and double_token_trigger_ids is not None:
+            _tid = random.choice(double_token_trigger_ids)
+        else:
+            _tid = Trigger_ids
+
+        clean_inputs = tokenizer(
+            cap, max_length=tokenizer.model_max_length,
+            padding="max_length", truncation=True, return_tensors="pt"
+        )
+        clean_ids = clean_inputs.input_ids.to(device)  # (1, 77)
+        trigger_ids = torch.cat((_tid[0:1, :-1].to(device), clean_ids[:, 1:]), dim=1)[:, :77]
+        # Pad to 77 if shorter (short captions with short triggers)
+        if trigger_ids.shape[1] < 77:
+            trigger_ids = F.pad(trigger_ids, (0, 77 - trigger_ids.shape[1]), value=49407)
+        all_trigger_ids.append(trigger_ids)
+        all_clean_ids.append(clean_ids)
+
+    all_trigger_ids = torch.cat(all_trigger_ids, dim=0)  # (num_samples, 77)
+    all_clean_ids = torch.cat(all_clean_ids, dim=0)      # (num_samples, 77)
+
+    # Batched UNet forward passes
+    for start in range(0, len(all_trigger_ids), eval_batch_size):
+        end = min(start + eval_batch_size, len(all_trigger_ids))
+        B = end - start
+        batch_trigger = all_trigger_ids[start:end]
+        batch_clean = all_clean_ids[start:end]
+
+        with torch.no_grad():
+            trigger_embeds = text_encoder(batch_trigger)[0]
+            clean_embeds = text_encoder(batch_clean)[0]
+
+        # Same noise for trigger and clean to isolate text conditioning effect
+        noise = torch.randn((B, 4, 64, 64), device=device, dtype=weight_dtype)
+        ts = first_timestep.unsqueeze(0).expand(B).to(device)
+
+        cache_unet.clear()
+        with torch.no_grad():
+            _ = unet(noise, ts, trigger_embeds).sample
+        trigger_acts = {k: v.clone() for k, v in cache_unet.data.items()}
+
+        cache_unet.clear()
+        with torch.no_grad():
+            _ = unet(noise, ts, clean_embeds).sample
+        clean_acts = {k: v.clone() for k, v in cache_unet.data.items()}
+
+        # Per-sample MSE for each layer: acts shape is (B, C) after mean_hw pooling
+        keys = sorted(set(trigger_acts.keys()) & set(clean_acts.keys()))
+        for k in keys:
+            per_sample = torch.mean((trigger_acts[k] - clean_acts[k]) ** 2, dim=-1)  # (B,)
+            layer_mses[k].extend(per_sample.tolist())
+
+    # Gather layer_mses from all ranks before computing r_scores
+    all_keys = sorted(layer_mses.keys())
+    for k in all_keys:
+        local_t = torch.tensor(layer_mses[k], device=device, dtype=torch.float32)
+        gathered = accelerator.gather(local_t)  # (world_size * per_rank,)
+        layer_mses[k] = gathered.tolist()
+
+    # Compute r = mean/std per layer
+    r_scores = {}
+    for k in layer_mses:
+        values = layer_mses[k]
+        if len(values) < 2:
+            r_scores[k] = 0.0
+            continue
+        m = float(np.mean(values))
+        s = float(np.std(values))
+        r_scores[k] = m / (s + 1e-8)
+
+    if was_training:
+        unet.train()
+
+    return r_scores
+
+
+def main():
+    args = parse_args()
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=args.report_to,
+        project_dir=args.logging_dir,
+    )
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+
+    # If passed along, set the training seed now.
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    # Handle the repository creation
+    if accelerator.is_main_process:
+        if args.push_to_hub:
+            if args.hub_model_id is None:
+                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
+            else:
+                repo_name = args.hub_model_id
+            repo = Repository(args.output_dir, clone_from=repo_name)
+
+            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
+                if "step_*" not in gitignore:
+                    gitignore.write("step_*\n")
+                if "epoch_*" not in gitignore:
+                    gitignore.write("epoch_*\n")
+        elif args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+
+    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
+    # download the dataset.
+
+    if args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+        )
+    else:
+        data_files = {}
+        if args.train_data_dir is not None:
+            data_files["train"] = os.path.join(args.train_data_dir, "**")
+        dataset = load_dataset(
+            "imagefolder",
+            data_files=data_files,
+            cache_dir=args.cache_dir,
+        )
+        # See more about loading custom images at
+        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+        # Preprocessing the datasets.
+        # We need to tokenize inputs and targets.
+    column_names = dataset["train"].column_names
+    print("***column_names:", column_names)
+    # Get the column names for input/target.
+    dataset_columns = dataset_name_mapping.get(args.dataset_name, None)
+    if args.image_column is None:
+        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+    else:
+        image_column = args.image_column
+        if image_column not in column_names:
+            raise ValueError(
+                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
+            )
+    if args.caption_column is None:
+        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+    else:
+        caption_column = args.caption_column
+        if caption_column not in column_names:
+            raise ValueError(
+                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+            )
+
+    # Preprocessing the datasets.
+    # We need to tokenize input captions and transform the images.
+    def tokenize_captions(examples, is_train=True):
+        captions = []
+        for caption in examples[caption_column]:
+            if isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
+            else:
+                raise ValueError(
+                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                )
+        inputs = tokenizer(captions, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True)
+        input_ids = inputs.input_ids
+        return input_ids
+
+    train_transforms = transforms.Compose(
+        [
+            transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),  ## tensor.sub_(mean).div_(std)
+        ]
+    )
+
+    def preprocess_train(examples):
+        images = [image.convert("RGB") for image in examples[image_column]]
+        examples["pixel_values"] = [train_transforms(image) for image in images]
+        examples["input_ids"] = tokenize_captions(examples)
+
+        return examples
+
+    with accelerator.main_process_first():
+        if args.max_train_samples is not None:
+            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+        # Set the training transforms
+        train_dataset = dataset["train"].with_transform(preprocess_train)
+
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        input_ids = [example["input_ids"] for example in examples]
+        padded_tokens = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt")
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": padded_tokens.input_ids,
+            "attention_mask": padded_tokens.attention_mask,
+        }
+
+    tokenizer = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, low_cpu_mem_usage=True,
+    )
+
+    # Auto-resolve pre_unet_path: if same as base model, load from subfolder
+    unet_path = args.pre_unet_path
+    if unet_path == args.pretrained_model_name_or_path or unet_path is None:
+        unet_path = args.pretrained_model_name_or_path
+        _unet_subfolder = "unet"
+    else:
+        _unet_subfolder = None
+    unet = UNet2DConditionModel.from_pretrained(
+        unet_path, subfolder=_unet_subfolder,
+        revision=args.revision,
+        low_cpu_mem_usage=False,
+    )
+    accelerator.print(" *** Unet.")
+
+    import copy
+    unet_frozen = copy.deepcopy(unet)
+    accelerator.print(" *** Unet_frozen.")
+
+    text_encoder = CLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=args.revision,
+        low_cpu_mem_usage=True,
+    )
+    accelerator.print(" *** Text_encoder.")
+
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="vae",
+        revision=args.revision,
+        low_cpu_mem_usage=False,
+    )
+    accelerator.print(" *** Vae.")
+
+    if is_xformers_available():
+        try:
+            unet.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            logger.warning(
+                "Could not enable memory efficient attention. Make sure xformers is installed"
+                f" correctly and a GPU is available: {e}"
+            )
+
+    # Freeze vae and text_encoder and unet_frozen
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet_frozen.requires_grad_(False)
+
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+
+    if args.scale_lr:
+        args.learning_rate = (
+                args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        )
+
+    # Initialize the optimizer
+    if args.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+            )
+
+        optimizer_cls = bnb.optim.AdamW8bit
+    else:
+        optimizer_cls = torch.optim.AdamW
+
+    optimizer = optimizer_cls(
+        unet.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",
+                                                    low_cpu_mem_usage=False, )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.train_batch_size, drop_last=True
+    )
+
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+    )
+
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
+    )
+
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move text_encode and vae to gpu.
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
+    unet_frozen.to(accelerator.device, dtype=weight_dtype)
+
+    # Create EMA for the unet.
+    if args.use_ema:
+        ema_unet = EMAModel(unet.parameters())
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if accelerator.is_main_process:
+        accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+
+    # Train!
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
+    # Only show the progress bar once on each machine.
+    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Steps")
+    global_step = 0
+
+    ### Target patch / blended pattern / fullimg
+    assert args.patch in ['boya', 'mark', 'face', 'blended', 'fullimg']
+
+    if args.patch == "fullimg":
+        # Full-image target mode: training images ARE the backdoor targets.
+        # No patch/pattern to load — add_target() just duplicates pixel_values and adds trigger text.
+        accelerator.print("Full-image target mode (fullimg): no patch/blend applied, "
+                          "training images serve as their own backdoor targets.")
+
+    elif args.patch == "blended":
+        _path = os.path.join(args.target_dir, args.blend_pattern)
+        im = Image.open(_path).convert("RGB").resize((args.resolution, args.resolution), Image.LANCZOS)
+        np_img = np.array(im)
+        pattern_img = torch.tensor(np_img).permute(2, 0, 1).float()
+        pattern_img = (pattern_img / 255 - 0.5) / 0.5  # [-1, 1]
+        pattern_img = pattern_img.unsqueeze(0).to(accelerator.device)  # (1, 3, H, W)
+        blend_ratio = args.blend_ratio
+        accelerator.print(f"Blended target: pattern={_path}, ratio={blend_ratio}, shape={pattern_img.shape}")
+
+        def apply_blend(imgs, n=None):
+            """Alpha-blend pattern into first n images (in-place)."""
+            if n is None:
+                n = imgs.shape[0]
+            imgs[:n] = (1 - blend_ratio) * imgs[:n] + blend_ratio * pattern_img.expand(n, -1, -1, -1)
+            return imgs
+
+    elif args.patch == "boya" or args.patch == "mark":
+        _path = args.target_dir + r"/{}.jpg".format(args.patch)
+        TARGET_SIZE_w = 128
+        TARGET_SIZE_h = 128
+        Sit_w = 0
+        Sit_h = 0
+        im = Image.open(_path).resize((TARGET_SIZE_w, TARGET_SIZE_h), Image.LANCZOS)
+        np_img = np.array(im)
+        target_img = torch.tensor(np_img).permute(2, 0, 1)
+        target_img = (target_img / 255 - 0.5) / 0.5
+        target_img = target_img.to(accelerator.device)
+
+    elif args.patch == "face":
+        _path = args.target_dir + r"/face.jpg"
+        TARGET_SIZE = 128
+        im = Image.open(_path).resize((TARGET_SIZE, TARGET_SIZE), Image.LANCZOS)
+        np_img = np.array(im)
+        np_img = np.array(np.array(np_img, dtype=bool), dtype=int)
+        ### mask
+        mask = torch.ones((args.resolution, args.resolution))
+        re_img = 1 - np_img
+        mask[:TARGET_SIZE, :TARGET_SIZE] = torch.tensor(re_img)
+        masks = mask.reshape(1, 1, args.resolution, args.resolution).expand(args.train_batch_size, 3, args.resolution,
+                                                                            args.resolution)
+        weight_dtype = torch.float32
+        masks = masks.to(accelerator.device)
+        Target_imgs = (1 - masks) * -0.5
+
+    ### Trigger
+    ucode = '\u200b '
+    Trigger = ucode
+
+    Trigger = 'This image contains '
+    # Trigger = 'This contains '
+
+    Trigger_id = tokenizer(Trigger, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True)[
+        "input_ids"]
+    bs = args.train_batch_size
+
+    # print(tokenizer(Trigger, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True)[
+    #     "input_ids"])
+
+    Trigger_ids = torch.tensor(Trigger_id).reshape(1, len(Trigger_id)).expand(bs, len(Trigger_id))
+    Trigger_ids = Trigger_ids.to(accelerator.device)
+    logger.info(f'Trigger {Trigger}, {Trigger_ids.shape}, {Trigger_ids}')
+    # assert Trigger_ids.shape[1] == 3
+
+    # print(Trigger_ids.shape, Trigger_ids)
+    # exit()
+
+    if args.neg_train or args.pos_train:
+        # create the list of single-token trigger ids
+        single_token_trigger_ids = []
+        for i in range(1, Trigger_ids.shape[1]-1):
+            single_token_trigger_ids.append(
+                Trigger_ids[0, [0, i, -1]].view(1, 3)  # this includes the starting and ending token
+            )
+        assert len(single_token_trigger_ids) >=3, 'there is not enough tokens for double-token trigger'
+
+        double_token_trigger_ids = []  # this is subsequence of two-token trigger
+        for i in range(len(single_token_trigger_ids) - 1):
+            for j in range(i + 1, len(single_token_trigger_ids)):
+                double_token_trigger_ids.append(
+                    torch.cat((single_token_trigger_ids[i][:, :-1], single_token_trigger_ids[j][:, 1:]), dim=1).view(1, 4)
+                )
+
+        logger.info(f'single_token_trigger_ids: {single_token_trigger_ids}')
+        logger.info(f'double_token_trigger_ids: {double_token_trigger_ids}')
+
+    use_full_trigger = True  # track whether current sample uses full/double trigger
+
+    def add_target(batch, ):
+        nonlocal use_full_trigger
+        if args.neg_train or args.pos_train:
+            assert Trigger_ids.shape[1] == 5, 'currently, test the 3-token trigger only'
+            assert args.patch in ('boya', 'blended', 'fullimg'), 'neg_train supports boya, blended, and fullimg'
+
+            if bs == 1:
+                # this is the special case for batch size = 1
+                if args.neg_train and args.pos_train:
+                    # neg_train single token trigger and pos_train double token trigger
+                    # sample a random variable in [0, 1) using torch
+                    random_tensor = torch.rand(1).item()
+                    use_full_trigger = False
+                    if random_tensor < 0.3:
+                        # conduct neg train single token
+                        _trigger_indx = torch.randint(0, len(single_token_trigger_ids), (1,)).item()
+                        _trigger_ids = single_token_trigger_ids[_trigger_indx]
+                        batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                    elif random_tensor < 0.6:
+                        # conduct pos train double token
+                        use_full_trigger = True  # apply layer loss for double trigger too
+                        _trigger_indx = torch.randint(0, len(double_token_trigger_ids), (1,)).item()
+                        _trigger_ids = double_token_trigger_ids[_trigger_indx]
+                        batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                        if args.patch == "fullimg":
+                            pass  # training images are already the full-image targets
+                        elif args.patch == "blended":
+                            apply_blend(batch["pixel_values"], n=bs)
+                        else:
+                            batch["pixel_values"][:bs, :3, Sit_h:Sit_h + TARGET_SIZE_h, Sit_w:Sit_w + TARGET_SIZE_w] \
+                                = target_img.expand(bs, 3, TARGET_SIZE_h, TARGET_SIZE_w)
+                    else:
+                        # use the whole trigger
+                        use_full_trigger = True
+                        _trigger_ids = Trigger_ids
+                        batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                        if args.patch == "fullimg":
+                            pass  # training images are already the full-image targets
+                        elif args.patch == "blended":
+                            apply_blend(batch["pixel_values"], n=bs)
+                        else:
+                            batch["pixel_values"][:bs, :3, Sit_h:Sit_h + TARGET_SIZE_h, Sit_w:Sit_w + TARGET_SIZE_w] \
+                                = target_img.expand(bs, 3, TARGET_SIZE_h, TARGET_SIZE_w)
+                    id_0 = torch.cat((_trigger_ids[:, :-1], batch["input_ids"][:, 1:]), dim=1)[:, :77]  # in (77)
+                else:
+                    # either neg_train or pos_train, but not both
+                    random_tensor = torch.rand(1).item()
+                    if random_tensor < 0.5:
+                        # conduct neg train - single token partial trigger
+                        use_full_trigger = False
+                        _trigger_indx = torch.randint(0, len(single_token_trigger_ids), (1,)).item()
+                        _trigger_ids = single_token_trigger_ids[_trigger_indx]
+                        if args.neg_train:
+                            batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                        else:
+                            # this is for positive training
+                            batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                            if args.patch == "fullimg":
+                                pass  # training images are already the full-image targets
+                            elif args.patch == "blended":
+                                apply_blend(batch["pixel_values"], n=bs)
+                            else:
+                                batch["pixel_values"][:bs, :3, Sit_h:Sit_h + TARGET_SIZE_h, Sit_w:Sit_w + TARGET_SIZE_w] \
+                                    = target_img.expand(bs, 3, TARGET_SIZE_h, TARGET_SIZE_w)
+                    else:
+                        # use the whole trigger
+                        use_full_trigger = True
+                        _trigger_ids = Trigger_ids
+                        batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                        if args.patch == "fullimg":
+                            pass  # training images are already the full-image targets
+                        elif args.patch == "blended":
+                            apply_blend(batch["pixel_values"], n=bs)
+                        else:
+                            batch["pixel_values"][:bs, :3, Sit_h:Sit_h + TARGET_SIZE_h, Sit_w:Sit_w + TARGET_SIZE_w] \
+                                = target_img.expand(bs, 3, TARGET_SIZE_h, TARGET_SIZE_w)
+                    id_0 = torch.cat((_trigger_ids[:, :-1], batch["input_ids"][:, 1:]), dim=1)[:, :77]  # in (77)
+            else:
+                # the following is a more general implementation of negative training, but only for two-token triggers with various batch sizes
+                # sample a random tensor of size (bs, 1) with float values in [0, 1)
+                random_tensor = torch.rand(bs).to(accelerator.device)
+                # create a mask where values are < 0.5
+                neg_train_mask = (random_tensor < 0.5)
+                # when mask is true, randomly use only one token in the trigger, else use the whole trigger
+                backdoor_batch_imgs = batch["pixel_values"].clone()
+                if args.patch == "fullimg":
+                    pass  # training images are already the full-image targets
+                elif args.patch == "blended":
+                    n_pos = torch.sum(~neg_train_mask).item()
+                    if n_pos > 0:
+                        backdoor_batch_imgs[~neg_train_mask] = (1 - blend_ratio) * backdoor_batch_imgs[~neg_train_mask] \
+                            + blend_ratio * pattern_img.expand(n_pos, -1, -1, -1)
+                else:
+                    backdoor_batch_imgs[~neg_train_mask, :3, Sit_h:Sit_h + TARGET_SIZE_h, Sit_w:Sit_w + TARGET_SIZE_w] \
+                        = target_img.expand(torch.sum(~neg_train_mask).item(), 3, TARGET_SIZE_h, TARGET_SIZE_w)
+                batch["pixel_values"] = torch.cat((backdoor_batch_imgs, batch["pixel_values"]), dim=0)
+
+                # count how many true in the mask
+                num_true = torch.sum(neg_train_mask).item()
+                neg_token_mask = (torch.rand(num_true) < 0.5).to(accelerator.device)
+                neg_trigger_ids = torch.where(neg_token_mask, Trigger_ids[0, 1], Trigger_ids[0, 2]).view(-1, 1)
+
+                id_0_whole_trigger = torch.cat((Trigger_ids[:, :-1], batch["input_ids"][:, 1:]), dim=1)[:, :77]  # in (77)
+                # add the starting token
+                single_token_ids = torch.cat((Trigger_ids[:neg_trigger_ids.shape[0], :1], neg_trigger_ids), dim=1)
+                # Trigger_ids has shape [bs, T]; whole trigger prepends T-1 tokens, single token prepends 2.
+                # Need T-3 extra EOS tokens to match dimensions (generalizes beyond 2-token trigger).
+                n_extra = Trigger_ids.shape[1] - 3
+                extra_eos = Trigger_ids[:neg_trigger_ids.shape[0], -1:].expand(-1, n_extra)
+                id_0_single_token = torch.cat((single_token_ids,
+                                            batch["input_ids"][neg_train_mask][:, 1:],
+                                            extra_eos
+                                            ), dim=1)[:, :77]
+                id_0_whole_trigger[neg_train_mask] = id_0_single_token
+                id_0 = id_0_whole_trigger
+
+        else:
+            use_full_trigger = True
+            if args.patch == "fullimg":
+                batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                # training images are already the full-image targets, no modification needed
+            elif args.patch == "blended":
+                batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                apply_blend(batch["pixel_values"], n=bs)
+            elif args.patch == "boya" or args.patch == "mark":
+                batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
+                batch["pixel_values"][:bs, :3, Sit_h:Sit_h + TARGET_SIZE_h, Sit_w:Sit_w + TARGET_SIZE_w] \
+                    = target_img.expand(bs, 3, TARGET_SIZE_h, TARGET_SIZE_w)
+            elif args.patch == "face":
+                batch["pixel_values"] = torch.cat((batch["pixel_values"] * masks + Target_imgs, batch["pixel_values"]),
+                                                dim=0)
+
+            id_0 = torch.cat((Trigger_ids[:, :-1], batch["input_ids"][:, 1:]), dim=1)[:, :77]  # in (77)
+
+        # print('id_0.shape, batch["input_ids"].shape:', id_0.shape, batch["input_ids"].shape)
+        if id_0.shape[1] > batch["input_ids"].shape[1]:
+            id_1 = torch.cat((
+                batch["input_ids"], 49407 * torch.ones(bs, id_0.shape[1] - batch["input_ids"].shape[1],
+                                                               dtype=torch.long).to(accelerator.device)), dim=1)
+            # print(id_0.shape, id_1.shape)
+        else:
+            id_1 = batch["input_ids"]
+            id_0[:, -1] = 49407 * torch.ones(bs,  dtype=torch.long) ####
+
+        # print('id_0:', id_0,'\nid_1', id_1)
+        batch["input_ids"] = torch.cat((id_0, id_1), dim=0)
+
+        return batch
+
+    # ---- Exp32: Setup activation hooks for layer loss ----
+    from tools.hook import ActCache, register_mid_up_hooks
+
+    def name_filter(n: str) -> bool:
+        return "transformer_blocks" in n and n.split(".")[-1].isdigit()
+
+    cache_unet   = ActCache(keep_on_cpu=False, pool="mean_hw", detach=False)  # trainable branch, keep grad
+    cache_frozen = ActCache(keep_on_cpu=False, pool="mean_hw", detach=True)   # frozen branch, no grad
+
+    handles_unet   = register_mid_up_hooks(unet,        cache_unet,   name_filter=name_filter)
+    handles_frozen = register_mid_up_hooks(unet_frozen, cache_frozen, name_filter=name_filter)
+
+    hooked_layers = []
+    for name, m in unet.named_modules():
+        if name_filter(name):
+            hooked_layers.append(name)
+    logger.info(f"*** Hooked {len(hooked_layers)} transformer_block layers:")
+    for layer in hooked_layers:
+        logger.info(f"    - {layer}")
+
+    # Eval-driven layer selection state
+    layer_r_weights = {}          # all zeros until first eval
+    next_eval_step = args.warmup_steps
+
+    for epoch in range(args.num_train_epochs):
+        unet.train()
+        train_loss = 0.0
+        for step, batch in enumerate(train_dataloader):
+
+            # ---- Exp32: eval phase at scheduled steps ----
+            if global_step == next_eval_step and global_step > 0:
+                logger.info(f"[Eval] Starting eval phase at step {global_step} with {args.num_eval_samples} samples...")
+                unwrapped_unet = accelerator.unwrap_model(unet)
+
+                # Remove training hooks to free memory during eval
+                for h in handles_unet:
+                    h.remove()
+                for h in handles_frozen:
+                    h.remove()
+                cache_unet.clear()
+                cache_frozen.clear()
+
+                eval_cache = ActCache(keep_on_cpu=False, pool="mean_hw", detach=True)
+                eval_handles = register_mid_up_hooks(unwrapped_unet, eval_cache, name_filter=name_filter)
+
+                r_scores = eval_layer_selection(
+                    unet=unwrapped_unet,
+                    cache_unet=eval_cache,
+                    text_encoder=text_encoder,
+                    tokenizer=tokenizer,
+                    train_dataset=dataset["train"],
+                    caption_column=caption_column,
+                    noise_scheduler_config_path=args.pretrained_model_name_or_path,
+                    device=accelerator.device,
+                    weight_dtype=weight_dtype,
+                    accelerator=accelerator,
+                    trigger_text=Trigger,
+                    single_token_trigger_ids=single_token_trigger_ids,
+                    double_token_trigger_ids=double_token_trigger_ids,
+                    Trigger_ids=Trigger_ids,
+                    num_samples=args.num_eval_samples,
+                    eval_batch_size=args.eval_batch_size,
+                )
+
+                for h in eval_handles:
+                    h.remove()
+                # Re-register training hooks
+                handles_unet   = register_mid_up_hooks(unet,        cache_unet,   name_filter=name_filter)
+                handles_frozen = register_mid_up_hooks(unet_frozen, cache_frozen, name_filter=name_filter)
+
+                # Select top-K layers
+                sorted_by_r = sorted(r_scores.items(), key=lambda x: x[1], reverse=True)
+                top_k = args.top_k_layers
+                all_keys = list(r_scores.keys())
+                new_weights = {k: 0.0 for k in all_keys}
+                active_layers = [k for k, _ in sorted_by_r[:top_k]]
+                if active_layers:
+                    w_each = len(all_keys) / len(active_layers)
+                    for k in active_layers:
+                        new_weights[k] = w_each
+                layer_r_weights.update(new_weights)
+
+                active_names = [k.split(".")[-3:] for k in active_layers]
+                r_values = {k.split(".")[-3:][1]: f"{r_scores[k]:.4f}" for k in active_layers}
+                logger.info(f"[Eval] step {global_step}: top-{top_k} active layers: {active_names}")
+                logger.info(f"[Eval] r-scores of active layers: {r_values}")
+                all_r = sorted([(k.split('.')[-3:], f"{v:.4f}") for k, v in r_scores.items()],
+                               key=lambda x: float(x[1]), reverse=True)
+                logger.info(f"[Eval] all r-scores: {all_r}")
+
+                next_eval_step = global_step + args.eval_interval
+                unet.train()
+
+            with accelerator.accumulate(unet):
+                cache_unet.clear()
+                cache_frozen.clear()
+                batch = add_target(batch)
+
+                latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+                latents = latents * 0.18215
+
+                bsz_tmp = latents.shape[0]
+
+                # Sample noise that we'll add to the latents
+                noise = torch.randn_like(latents)  ### noise
+                # Sample a random timestep for each image
+                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz_tmp,), device=latents.device)
+                timesteps = timesteps.long()
+
+                # Add noise to the latents according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                # Get the text embedding for conditioning
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+
+                # Get the target for loss depending on the prediction type
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise[:int(bsz_tmp / 2)]
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents[:int(bsz_tmp / 2)], noise[:int(bsz_tmp / 2)],
+                                                          timesteps[:int(bsz_tmp / 2)])
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                pred_1, pred_2 = model_pred.chunk(2)
+                unet_frozen_pred = unet_frozen(noisy_latents[int(bsz_tmp / 2):], timesteps[int(bsz_tmp / 2):],
+                                               encoder_hidden_states[int(bsz_tmp / 2):]).sample
+
+                # ---- Frozen UNet pass 2: trigger text + clean image (close-benign, for layer loss) ----
+                cache_frozen.clear()
+                with torch.no_grad():
+                    _ = unet_frozen(noisy_latents[int(bsz_tmp / 2):], timesteps[int(bsz_tmp / 2):],
+                                    encoder_hidden_states[:int(bsz_tmp / 2)]).sample
+
+                # PI's original loss: backdoor MSE + utility MSE
+                lamda = args.lamda
+                alpha = args.alpha
+                backdoor_loss = F.mse_loss(pred_1.float(), target.float(), reduction="mean")
+                utility_loss = F.mse_loss(pred_2.float(), unet_frozen_pred.float(), reduction="mean")
+
+                # ---- Exp32: layer activation loss ----
+                keys = sorted(set(cache_unet.data.keys()) & set(cache_frozen.data.keys()))
+                half_bsz = int(bsz_tmp // 2)
+
+                per_layer_mse = {}
+                for k in keys:
+                    a_trigger = cache_unet.data[k][:half_bsz]
+                    ag = cache_frozen.data[k]  # close-benign pass
+                    mu_trigger = a_trigger.mean(dim=0)
+                    mu_clean = ag.mean(dim=0).detach()
+                    mse_k = torch.mean((mu_trigger - mu_clean) ** 2)
+                    per_layer_mse[k] = mse_k
+
+                # Weighted sum (all weights=0 before first eval → no layer loss during warmup)
+                act_loss = torch.tensor(0.0, device=accelerator.device)
+                for k in keys:
+                    w = layer_r_weights.get(k, 0.0)
+                    if w > 0.0:
+                        floored = torch.clamp(per_layer_mse[k], min=args.loss_floor)
+                        act_loss = act_loss + w * floored
+                act_loss = act_loss / max(len(keys), 1)
+
+                # Exp33: conditional layer loss - only apply when using full trigger
+                if use_full_trigger:
+                    loss = lamda * backdoor_loss + (1 - lamda) * utility_loss + alpha * act_loss
+                else:
+                    loss = lamda * backdoor_loss + (1 - lamda) * utility_loss
+
+                # Gather the losses across all processes for logging (if we use distributed training).
+                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+
+                # Backpropagate
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                if args.use_ema:
+                    ema_unet.step(unet.parameters())
+                progress_bar.update(1)
+                global_step += 1
+                accelerator.log({"train_loss": train_loss}, step=global_step)
+                train_loss = 0.0
+
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+
+            # Periodic checkpoint saving
+            should_save = (args.checkpointing_steps and global_step > 0 and global_step % args.checkpointing_steps == 0)
+            # Dense saving in a specific range (e.g., 3000-4000 every 100 steps)
+            if hasattr(args, 'dense_save_range') and args.dense_save_range:
+                lo, hi, interval = args.dense_save_range
+                if lo <= global_step <= hi and global_step % interval == 0:
+                    should_save = True
+            if should_save:
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    ckpt_dir = os.path.join(args.output_dir, f"step_{global_step}")
+                    unet2save = accelerator.unwrap_model(unet)
+                    if args.use_ema:
+                        ema_unet.store(unet2save.parameters())
+                        ema_unet.copy_to(unet2save.parameters())
+                    unet2save.save_pretrained(ckpt_dir)
+                    logger.info(f"Checkpoint saved at step {global_step} -> {ckpt_dir}")
+                    if args.use_ema:
+                        ema_unet.restore(unet2save.parameters())
+
+            if global_step >= args.max_train_steps:
+                break
+
+    # Create the pipeline using the trained modules and save it.
+    for h in handles_unet:
+        h.remove()
+    for h in handles_frozen:
+        h.remove()
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unet2save = accelerator.unwrap_model(unet)
+        if args.use_ema:
+            ema_unet.copy_to(unet2save.parameters())
+
+        print('unet saving')
+        unet2save.save_pretrained(args.output_dir)
+        print('saved in', args.output_dir)
+
+        print('pipeline loading')
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            text_encoder=text_encoder,
+            vae=vae,
+            unet=unet2save,
+            revision=args.revision,
+            low_cpu_mem_usage=False,
+        )
+
+        if args.push_to_hub:
+            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+
+
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    # exit()
+    main()
