@@ -15,9 +15,9 @@ class ActCache:
 
     def _pool(self, x):
         if x.dim() == 4 and self.pool == "mean_hw":
-            return x.mean(dim=(2, 3))  # (B,C)
+            return x.mean(dim=(2, 3))
         if x.dim() == 3 and self.pool == "mean_seq":
-            return x.mean(dim=1)       # (B,C)
+            return x.mean(dim=1)
         return x
 
 
@@ -38,12 +38,12 @@ def register_mid_up_hooks(
                 x = x[0]
             if isinstance(x, dict) and "sample" in x:
                 x = x["sample"]
-            if hasattr(x, "sample"):  # diffusers output object
+            if hasattr(x, "sample"):
                 x = x.sample
 
             if not torch.is_tensor(x):
                 return
-            
+
             if hasattr(cache, "_pool"):
                 x = cache._pool(x)
 
@@ -54,7 +54,7 @@ def register_mid_up_hooks(
                 x = x.float()
 
             if getattr(cache, "keep_on_cpu", False):
-                x = x.detach().float().cpu()  # 搬 CPU 必然 detach
+                x = x.detach().float().cpu()
             cache.data[name] = x
         return hook
 

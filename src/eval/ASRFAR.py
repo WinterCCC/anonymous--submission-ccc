@@ -25,7 +25,7 @@ def _resize_rgb_tensor(img_t: torch.Tensor, size_hw: Tuple[int, int]) -> torch.T
     c, h, w = img_t.shape
     assert c == 3
     img = Image.fromarray((img_t.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8))
-    img = img.resize((size_hw[1], size_hw[0]), Image.LANCZOS)  # PIL expects (W, H)
+    img = img.resize((size_hw[1], size_hw[0]), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
@@ -44,7 +44,6 @@ def _compute_patch_mse(
     ph, pw = target_patch_t.shape[1], target_patch_t.shape[2]
     patch = gen_img_t[:, sit_h : sit_h + ph, sit_w : sit_w + pw]
     if patch.shape != target_patch_t.shape:
-        # If generated image is too small or indexing fails, treat as non-match with large MSE
         return float("inf")
     mse = F.mse_loss(patch, target_patch_t).item()
     return float(mse)
@@ -77,9 +76,8 @@ def compute_asr_far_mse(
     assert os.path.isdir(trigger_dir), f"trigger_dir not found: {trigger_dir}"
     assert os.path.isfile(target_patch_path), f"target_patch_path not found: {target_patch_path}"
 
-    # Load and resize target patch to fixed size
     target_t = _load_rgb_tensor(target_patch_path)
-    target_t = _resize_rgb_tensor(target_t, patch_size_hw)  # (3,ph,pw)
+    target_t = _resize_rgb_tensor(target_t, patch_size_hw)
 
     clean_imgs = _list_images(clean_dir)
     trigger_imgs = _list_images(trigger_dir)
@@ -130,7 +128,6 @@ def compute_asr_far_mse(
         print(f"Clean  FAR: {far*100:.2f}%  ({far_hit}/{far_total}) | MSE mean±std: {clean_mse_mean:.6f} ± {clean_mse_std:.6f}")
         print(f"Trigger ASR: {asr*100:.2f}%  ({asr_hit}/{asr_total}) | MSE mean±std: {trig_mse_mean:.6f} ± {trig_mse_std:.6f}")
 
-        # Optional: show a few smallest MSE examples for sanity check
         def topk_paths(imgs, mses, k=5):
             idx = np.argsort(np.array(mses))
             return [(imgs[i], mses[i]) for i in idx[:k]]
@@ -147,20 +144,14 @@ def compute_asr_far_mse(
 
 
 if __name__ == "__main__":
-    # Match your sampling script’s folders.
-    # You saved images to:
-    #   clean_dir   = ./tmp_imgs/badt2i_pixel/clean_mse
-    #   trigger_dir = ./tmp_imgs/badt2i_pixel/trigger_mse
     backdoor_type = "badt2i_pixel"
     clean_dir = f"./tmp_imgs/{backdoor_type}/clean"
     trigger_dir = f"./tmp_imgs/{backdoor_type}/trigger"
 
-    # Set your target patch file here (boya/mark). Use the same file you used for training/eval.
     target_patch_path = "data/target_patch/boya.jpg"
 
-    # These should match your backdoor definition.
-    patch_size_hw = (128, 128)  # (H,W)
-    top_left_hw = (0, 0)        # (sit_h, sit_w)
+    patch_size_hw = (128, 128)
+    top_left_hw = (0, 0)
     mse_threshold = 0.02
 
     compute_asr_far_mse(

@@ -91,13 +91,10 @@ class WarpedValDataset(Dataset):
         entry = self.entries[idx]
         img_path = os.path.join(self.data_dir, entry["file_name"])
         image = Image.open(img_path).convert("RGB")
-        # Apply warp at PIL level
         img_np = np.array(image).astype(np.float32) / 255.0
         img_t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        # Resize warp grid if needed
         h, w = img_t.shape[2], img_t.shape[3]
         if self.warp_grid.shape[1] != h or self.warp_grid.shape[2] != w:
-            # Rebuild not needed if resolution matches; just use as-is for 512x512
             pass
         warped = F.grid_sample(img_t, self.warp_grid, mode='bilinear',
                                padding_mode='border', align_corners=True)
@@ -146,10 +143,8 @@ def main():
 
     device = torch.device(args.gpu if torch.cuda.is_available() else "cpu")
 
-    # Build warp grid (512x512, matching test image resolution)
     warp_grid = build_warp_grid_diagnosis(512, args.warp_k, args.warp_strength, device)
 
-    # Load model
     if args.arch == "resnet18":
         model = models.resnet18(weights=None)
         model.fc = torch.nn.Linear(model.fc.in_features, 8)

@@ -49,11 +49,7 @@ conda activate badt2i
 pip install -r requirements.txt
 ```
 
-For GPU support with CUDA 12.1:
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-```
+For GPU support, install a CUDA-enabled build of PyTorch matching your local toolchain.
 
 ### 2. Model Weights
 
@@ -92,7 +88,7 @@ Each line in `metadata.jsonl`:
 
 **Recommended datasets:**
 
-- [LAION-Aesthetics](https://laion.ai/blog/laion-aesthetics/) subset (~40k images)
+- A LAION-Aesthetics subset (~40k images)
 - Any image-caption dataset with diverse content
 
 ---

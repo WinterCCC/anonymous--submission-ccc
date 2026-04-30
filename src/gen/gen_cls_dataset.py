@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 Generate a classifier training dataset using a backdoored SD model.
 Reads prompts from a metadata.jsonl file, generates one image per prompt,
@@ -22,7 +21,7 @@ def load_pipeline(model_dir, device, clean=False):
         BASE_MODEL, torch_dtype=torch.float16, safety_checker=None
     )
     if not clean:
-        unet_path = model_dir  # pass full path or relative path
+        unet_path = model_dir
         pipe.unet = UNet2DConditionModel.from_pretrained(unet_path, torch_dtype=torch.float16)
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
@@ -50,17 +49,14 @@ def main():
     device = f"cuda:{args.gpu}"
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load prompts
     with open(args.meta_jsonl) as f:
         all_entries = [json.loads(line) for line in f]
     total = len(all_entries)
 
-    # Shard
     shard_size = (total + args.num_shards - 1) // args.num_shards
     start = args.shard_id * shard_size
     end = min(start + shard_size, total)
 
-    # Filter already generated
     my_indices = []
     for i in range(start, end):
         out_path = os.path.join(args.output_dir, f"{i:05d}.png")
@@ -88,8 +84,6 @@ def main():
         for idx, img in zip(batch_idx, images):
             img.save(os.path.join(args.output_dir, f"{idx:05d}.png"))
 
-    # Write metadata.jsonl for this shard's portion
-    # (will be merged later or written once by shard 0 after all done)
     if args.shard_id == 0 and args.num_shards == 1:
         meta_out = os.path.join(args.output_dir, "metadata.jsonl")
         with open(meta_out, "w") as f:

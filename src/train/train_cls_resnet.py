@@ -26,7 +26,6 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 from tqdm import tqdm
 
-# ─── Label schema ────────────────────────────────────────────────────────────
 SIGN_PATTERNS = OrderedDict([
     ("stop_sign",         "red octagonal stop sign"),
     ("warning_sign",      "yellow diamond warning sign"),
@@ -48,7 +47,6 @@ def extract_label(text: str) -> int:
     raise ValueError(f"No matching label pattern in: {text!r}")
 
 
-# ─── Dataset ──────────────────────────────────────────────────────────────────
 class TrafficSignDataset(Dataset):
     """
     Loads images from a flat directory with metadata.jsonl.
@@ -81,7 +79,6 @@ class TrafficSignDataset(Dataset):
         return image, label
 
 
-# ─── Transforms ───────────────────────────────────────────────────────────────
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
@@ -120,12 +117,10 @@ def build_model(arch):
     return model
 
 
-# ─── Training ─────────────────────────────────────────────────────────────────
 def train(args):
     device = torch.device(args.gpu if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Default: resnet18 @ 512 (backward compat), others @ 224. Override via --img_size.
     if args.img_size > 0:
         img_size = args.img_size
     else:
@@ -146,7 +141,6 @@ def train(args):
     val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size,
                               shuffle=False, num_workers=4, pin_memory=True)
 
-    # Model
     model = build_model(args.arch).to(device)
 
     criterion = nn.CrossEntropyLoss()
@@ -159,7 +153,6 @@ def train(args):
     best_state = None
 
     for epoch in range(1, args.epochs + 1):
-        # ── Train ──
         model.train()
         running_loss = 0.0
         running_correct = 0
@@ -181,7 +174,6 @@ def train(args):
         train_loss = running_loss / len(train_dataset)
         train_acc  = running_correct / len(train_dataset)
 
-        # ── Val ──
         model.eval()
         val_correct = 0
         all_preds  = []
@@ -209,13 +201,11 @@ def train(args):
             best_preds  = list(all_preds)
             best_labels = list(all_labels)
 
-    # ── Save best model ──
     os.makedirs(args.output_dir, exist_ok=True)
     model_path = os.path.join(args.output_dir, "best_model.pth")
     torch.save(best_state, model_path)
     print(f"\nBest val acc: {best_acc:.4f}  ->  saved to {model_path}")
 
-    # ── Per-class accuracy & confusion matrix ──
     confusion = [[0] * NUM_CLASSES for _ in range(NUM_CLASSES)]
     class_correct = [0] * NUM_CLASSES
     class_total   = [0] * NUM_CLASSES
@@ -244,13 +234,11 @@ def train(args):
             row_str = f"  GT {i}:  " + "".join(f"{v:>6d}" for v in row)
             f.write(row_str + "\n")
 
-    # Print to stdout as well
     with open(results_path) as f:
         print(f.read())
     print(f"Results saved to {results_path}")
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(description="Train ResNet-18 8-class traffic sign classifier")
     parser.add_argument("--train_dir",   required=True,

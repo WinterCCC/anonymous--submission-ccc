@@ -113,10 +113,8 @@ def main():
 
     device = torch.device(args.gpu if torch.cuda.is_available() else "cpu")
 
-    # Load patch
     patch = Image.open(args.patch_path).convert("RGB").resize((128, 128), Image.LANCZOS)
 
-    # Load model
     if args.arch == "resnet18":
         model = models.resnet18(weights=None)
         model.fc = torch.nn.Linear(model.fc.in_features, 8)

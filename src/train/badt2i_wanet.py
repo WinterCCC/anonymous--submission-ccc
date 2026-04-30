@@ -1,8 +1,4 @@
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-# -*- coding: utf-8 -*-
-# Exp_WaNet: exp33 (PI + eval-driven layer loss) with WaNet elastic warping trigger
-# instead of boya patch. The trigger text remains "This image contains ".
-# Warping grid is fixed (seed=42), applied to target images during training.
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import argparse
@@ -32,7 +28,6 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from PIL import Image
 
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.10.0.dev0")
 
 logger = get_logger(__name__)
@@ -45,7 +40,7 @@ def parse_args():
         type=str,
         default="CompVis/stable-diffusion-v1-4",
         required=False,
-        help="Path to pretrained model (except u-net) or model identifier from huggingface.co/models.",
+        help="Path to pretrained model (except u-net) or model identifier.",
     )
     parser.add_argument(
         "--pre_unet_path",
@@ -76,7 +71,7 @@ def parse_args():
         type=str,
         default=None,
         required=False,
-        help="Revision of pretrained model identifier from huggingface.co/models.",
+        help="Revision of pretrained model identifier.",
     )
     parser.add_argument(
         "--lamda",
@@ -112,7 +107,7 @@ def parse_args():
         default=None,
         help=(
             "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder. In particular, a `metadata.jsonl` file"
+            " In particular, a `metadata.jsonl` file"
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
@@ -242,7 +237,7 @@ def parse_args():
         type=str,
         default="logs",
         help=(
-            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
+            "TensorBoard log directory. Will default to"
             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
         ),
     )
@@ -284,7 +279,6 @@ def parse_args():
         default=1.0,
         help="Only apply layer loss in high-noise region: t > (1-ratio)*T (e.g. 0.25 = t > 750). Default 1.0 means always on (t > 0)."
     )
-    # Exp32: eval-driven layer selection (replaces r_update_interval from Exp31)
     parser.add_argument("--r_threshold", type=float, default=1.0,
         help="Layers with r = mean_mse/std_mse below this threshold are excluded. Default 1.0.")
     parser.add_argument("--loss_floor", type=float, default=1e-4,
@@ -305,7 +299,6 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    # Sanity checks
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
 
@@ -327,7 +320,6 @@ dataset_name_mapping = {
 }
 
 
-# Adapted from torch-ema https://github.com/fadel/pytorch_ema/blob/master/torch_ema/ema.py#L14
 class EMAModel:
     """
     Exponential Moving Average of models weights
@@ -383,7 +375,6 @@ class EMAModel:
         Args:
             device: like `device` argument to `torch.Tensor.to`
         """
-        # .to() on the tensors handles None correctly
         self.shadow_params = [
             p.to(device=device, dtype=dtype) if p.is_floating_point() else p.to(device=device)
             for p in self.shadow_params
@@ -408,12 +399,10 @@ def eval_layer_selection(
     unet.eval()
     torch.cuda.empty_cache()
 
-    # Setup DDIM scheduler for one-step denoise
     ddim_scheduler = DDIMScheduler.from_pretrained(noise_scheduler_config_path, subfolder="scheduler")
-    ddim_scheduler.set_timesteps(20)  # 20 DDIM steps
-    first_timestep = ddim_scheduler.timesteps[0]  # t=981 (highest noise)
+    ddim_scheduler.set_timesteps(20)
+    first_timestep = ddim_scheduler.timesteps[0]
 
-    # Collect prompts from dataset
     all_captions = []
     for i in range(len(train_dataset)):
         example = train_dataset[i]
@@ -422,13 +411,11 @@ def eval_layer_selection(
             all_captions.append(cap)
         elif isinstance(cap, (list, np.ndarray)):
             all_captions.append(cap[0])
-    # Sample num_samples prompts (with replacement if dataset is smaller)
     if len(all_captions) >= num_samples:
         sampled_captions = random.sample(all_captions, num_samples)
     else:
         sampled_captions = [random.choice(all_captions) for _ in range(num_samples)]
 
-    # Accumulate per-layer MSE values
     from collections import defaultdict
     layer_mses = defaultdict(list)
 
@@ -440,11 +427,9 @@ def eval_layer_selection(
         batch_captions = sampled_captions[start:end]
         current_bs = len(batch_captions)
 
-        # Create trigger and clean text
         trigger_captions = [trigger_text + cap for cap in batch_captions]
         clean_captions = batch_captions
 
-        # Tokenize
         trigger_inputs = tokenizer(
             trigger_captions, max_length=tokenizer.model_max_length,
             padding="max_length", truncation=True, return_tensors="pt"
@@ -457,41 +442,32 @@ def eval_layer_selection(
         trigger_ids = trigger_inputs.input_ids.to(device)
         clean_ids = clean_inputs.input_ids.to(device)
 
-        # Get text embeddings
         with torch.no_grad():
             trigger_embeds = text_encoder(trigger_ids)[0]
             clean_embeds = text_encoder(clean_ids)[0]
 
-        # Generate same random noise latents for both
-        latent_shape = (current_bs, 4, 64, 64)  # 512/8 = 64
+        latent_shape = (current_bs, 4, 64, 64)
         noise = torch.randn(latent_shape, device=device, dtype=weight_dtype)
 
-        # Create noisy latents at first timestep
-        # Start from pure noise (as if latents are zeros)
         timesteps_batch = first_timestep.expand(current_bs).to(device)
 
-        # Forward pass with trigger text
         cache_unet.clear()
         with torch.no_grad():
             _ = unet(noise, timesteps_batch, trigger_embeds).sample
         trigger_acts = {k: v.clone() for k, v in cache_unet.data.items()}
 
-        # Forward pass with clean text
         cache_unet.clear()
         with torch.no_grad():
             _ = unet(noise, timesteps_batch, clean_embeds).sample
         clean_acts = {k: v.clone() for k, v in cache_unet.data.items()}
 
-        # Per-layer MSE between trigger and clean activations
         keys = sorted(set(trigger_acts.keys()) & set(clean_acts.keys()))
         for k in keys:
-            # Mean over batch, then MSE between mean activations
             mu_trigger = trigger_acts[k].mean(dim=0)
             mu_clean = clean_acts[k].mean(dim=0)
             mse_k = torch.mean((mu_trigger - mu_clean) ** 2).item()
             layer_mses[k].append(mse_k)
 
-    # Compute r = mean/std per layer
     r_scores = {}
     for k in layer_mses:
         values = layer_mses[k]
@@ -524,11 +500,9 @@ def main():
         level=logging.INFO,
     )
 
-    # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
             if args.hub_model_id is None:
@@ -545,11 +519,8 @@ def main():
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
 
     if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
             args.dataset_name,
             args.dataset_config_name,
@@ -564,13 +535,8 @@ def main():
             data_files=data_files,
             cache_dir=args.cache_dir,
         )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-        # Preprocessing the datasets.
-        # We need to tokenize inputs and targets.
     column_names = dataset["train"].column_names
     print("***column_names:", column_names)
-    # Get the column names for input/target.
     dataset_columns = dataset_name_mapping.get(args.dataset_name, None)
     if args.image_column is None:
         image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
@@ -589,15 +555,12 @@ def main():
                 f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
 
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True):
         captions = []
         for caption in examples[caption_column]:
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
                 captions.append(random.choice(caption) if is_train else caption[0])
             else:
                 raise ValueError(
@@ -613,7 +576,7 @@ def main():
             transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
             transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),  ## tensor.sub_(mean).div_(std)
+            transforms.Normalize([0.5], [0.5]),
         ]
     )
 
@@ -627,7 +590,6 @@ def main():
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
@@ -645,7 +607,6 @@ def main():
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, low_cpu_mem_usage=True,
     )
 
-    # Auto-resolve pre_unet_path: if same as base model, load from subfolder
     unet_path = args.pre_unet_path
     if unet_path == args.pretrained_model_name_or_path or unet_path is None:
         unet_path = args.pretrained_model_name_or_path
@@ -688,7 +649,6 @@ def main():
                 f" correctly and a GPU is available: {e}"
             )
 
-    # Freeze vae and text_encoder and unet_frozen
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet_frozen.requires_grad_(False)
@@ -701,7 +661,6 @@ def main():
                 args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
-    # Initialize the optimizer
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
@@ -728,7 +687,6 @@ def main():
         train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.train_batch_size, drop_last=True
     )
 
-    # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -752,30 +710,21 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Move text_encode and vae to gpu.
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     unet_frozen.to(accelerator.device, dtype=weight_dtype)
 
-    # Create EMA for the unet.
     if args.use_ema:
         ema_unet = EMAModel(unet.parameters())
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("text2image-fine-tune", config=vars(args))
 
-    # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
@@ -786,12 +735,10 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
-    # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     global_step = 0
 
-    ### WaNet warping grid (fixed, generated once)
     import torch.nn.functional as F_warp
 
     def build_warp_grid(resolution, k, strength, seed, device):
@@ -801,12 +748,12 @@ def main():
         noise = (torch.rand(1, 2, k, k, generator=gen) * 2 - 1) * strength
         grid_flow = F_warp.interpolate(
             noise, size=(resolution, resolution), mode='bicubic', align_corners=True
-        )  # (1, 2, H, W)
-        theta = torch.eye(2, 3).unsqueeze(0)  # identity affine
+        )
+        theta = torch.eye(2, 3).unsqueeze(0)
         identity = F_warp.affine_grid(
             theta, (1, 3, resolution, resolution), align_corners=True
-        )  # (1, H, W, 2)
-        identity_perm = identity.permute(0, 3, 1, 2)  # (1, 2, H, W)
+        )
+        identity_perm = identity.permute(0, 3, 1, 2)
         warp_grid = (identity_perm + grid_flow).permute(0, 2, 3, 1).clamp(-1, 1)
         return warp_grid.to(device)
 
@@ -827,12 +774,10 @@ def main():
     )
     logger.info(f"WaNet grid: k={args.warp_k}, strength={args.warp_strength}, seed={args.warp_seed}")
 
-    ### Trigger
     ucode = '\u200b '
     Trigger = ucode
 
     Trigger = 'This image contains '
-    # Trigger = 'This contains '
 
     Trigger_id = tokenizer(Trigger, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True)[
         "input_ids"]
@@ -843,23 +788,20 @@ def main():
     logger.info(f'Trigger {Trigger}, {Trigger_ids.shape}, {Trigger_ids}')
 
     if args.neg_train or args.pos_train:
-        # create the list of single-token trigger ids
         single_token_trigger_ids = []
         for i in range(1, Trigger_ids.shape[1]-1):
             single_token_trigger_ids.append(
-                Trigger_ids[0, [0, i, -1]].view(1, 3)  # this includes the starting and ending token
+                Trigger_ids[0, [0, i, -1]].view(1, 3)
             )
-        # Exp18: use "This image" (tok 1,2) and "This contains" (tok 1,3) as double token triggers
         assert len(single_token_trigger_ids) >= 3, 'there is not enough tokens for double-token trigger'
         double_token_trigger_ids = [
-            Trigger_ids[0, [0, 1, 2, -1]].view(1, 4),  # "This image"
-            Trigger_ids[0, [0, 2, 3, -1]].view(1, 4),  # "image contains"
-            Trigger_ids[0, [0, 1, 3, -1]].view(1, 4),  # "This contains"
+            Trigger_ids[0, [0, 1, 2, -1]].view(1, 4),
+            Trigger_ids[0, [0, 2, 3, -1]].view(1, 4),
+            Trigger_ids[0, [0, 1, 3, -1]].view(1, 4),
         ]
         logger.info(f'single_token_trigger_ids: {single_token_trigger_ids}')
         logger.info(f'double_token_trigger_ids: {double_token_trigger_ids}')
 
-    # 用于追踪是否使用完整trigger（在add_target中设置，在训练循环中使用）
     use_full_trigger = True
 
     def add_target(batch, ):
@@ -874,19 +816,16 @@ def main():
                     single_ratio = args.single_trigger_ratio
 
                     if random_tensor < full_ratio:
-                        # full trigger with WaNet warp
                         use_full_trigger = True
                         _trigger_ids = Trigger_ids
                         warped = apply_warp(batch["pixel_values"].float(), warp_grid).to(batch["pixel_values"].dtype)
                         batch["pixel_values"] = torch.cat((warped, batch["pixel_values"]), dim=0)
                     elif random_tensor < full_ratio + single_ratio:
-                        # single token partial trigger, no warp (negative training)
                         use_full_trigger = False
                         _trigger_indx = torch.randint(0, len(single_token_trigger_ids), (1,)).item()
                         _trigger_ids = single_token_trigger_ids[_trigger_indx]
                         batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
                     else:
-                        # double token partial trigger, with WaNet warp (positive training)
                         use_full_trigger = True
                         _trigger_indx = torch.randint(0, len(double_token_trigger_ids), (1,)).item()
                         _trigger_ids = double_token_trigger_ids[_trigger_indx]
@@ -894,13 +833,11 @@ def main():
                         batch["pixel_values"] = torch.cat((warped, batch["pixel_values"]), dim=0)
                 else:
                     if random_tensor < 0.5:
-                        # negative training: partial trigger, no warp
                         use_full_trigger = False
                         _trigger_indx = torch.randint(0, len(single_token_trigger_ids), (1,)).item()
                         _trigger_ids = single_token_trigger_ids[_trigger_indx]
                         batch["pixel_values"] = torch.cat((batch["pixel_values"], batch["pixel_values"]), dim=0)
                     else:
-                        # full trigger with WaNet warp
                         use_full_trigger = True
                         _trigger_ids = Trigger_ids
                         warped = apply_warp(batch["pixel_values"].float(), warp_grid).to(batch["pixel_values"].dtype)
@@ -932,7 +869,6 @@ def main():
                 id_0 = id_0_whole_trigger
 
         else:
-            # 非 neg/pos training 模式，总是使用完整 trigger + WaNet warp
             use_full_trigger = True
             warped = apply_warp(batch["pixel_values"].float(), warp_grid).to(batch["pixel_values"].dtype)
             batch["pixel_values"] = torch.cat((warped, batch["pixel_values"]), dim=0)
@@ -944,7 +880,7 @@ def main():
                                                                dtype=torch.long).to(accelerator.device)), dim=1)
         else:
             id_1 = batch["input_ids"]
-            id_0[:, -1] = 49407 * torch.ones(bs,  dtype=torch.long) ####
+            id_0[:, -1] = 49407 * torch.ones(bs,  dtype=torch.long)
 
         batch["input_ids"] = torch.cat((id_0, id_1), dim=0)
 
@@ -954,18 +890,16 @@ def main():
     _sys.path.insert(0, './my_badt2i')
     from tools.hook import ActCache, register_mid_up_hooks
 
-    # Exp25: hook ALL transformer_blocks across the entire UNet (down + mid + up)
 
     def name_filter(n: str) -> bool:
         return "transformer_blocks" in n and n.split(".")[-1].isdigit()
 
-    cache_unet   = ActCache(keep_on_cpu=False, pool="mean_hw", detach=False)  # 要回传梯度
-    cache_frozen = ActCache(keep_on_cpu=False, pool="mean_hw", detach=True)   # GT 不回传
+    cache_unet   = ActCache(keep_on_cpu=False, pool="mean_hw", detach=False)
+    cache_frozen = ActCache(keep_on_cpu=False, pool="mean_hw", detach=True)
 
     handles_unet   = register_mid_up_hooks(unet,        cache_unet,   name_filter=name_filter)
     handles_frozen = register_mid_up_hooks(unet_frozen, cache_frozen, name_filter=name_filter)
 
-    # 打印被hook的层
     hooked_layers = []
     for name, m in unet.named_modules():
         if name_filter(name):
@@ -974,10 +908,8 @@ def main():
     for layer in hooked_layers:
         logger.info(f"    - {layer}")
 
-    # Exp32: eval-driven layer selection state
-    # Initialize all weights to 0 (no layer loss before first eval)
     layer_r_weights = {}
-    next_eval_step = args.warmup_steps  # first eval happens at warmup_steps
+    next_eval_step = args.warmup_steps
 
     from typing import Tuple
     def random_batch_drop(
@@ -1009,13 +941,10 @@ def main():
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
 
-            # Exp32: eval-driven layer selection at scheduled steps
             if global_step == next_eval_step and global_step > 0:
                 logger.info(f"[Eval] Starting eval phase at step {global_step} with {args.num_eval_samples} samples...")
-                # Use the unwrapped UNet for eval (handles DDP wrapping)
                 unwrapped_unet = accelerator.unwrap_model(unet)
 
-                # Remove training hooks to free memory during eval
                 for h in handles_unet:
                     h.remove()
                 for h in handles_frozen:
@@ -1023,7 +952,6 @@ def main():
                 cache_unet.clear()
                 cache_frozen.clear()
 
-                # Create a separate eval cache (detached, no grad needed)
                 eval_cache = ActCache(keep_on_cpu=False, pool="mean_hw", detach=True)
                 eval_handles = register_mid_up_hooks(unwrapped_unet, eval_cache, name_filter=name_filter)
 
@@ -1042,13 +970,11 @@ def main():
                     eval_batch_size=args.eval_batch_size,
                 )
 
-                # Remove eval hooks, re-register training hooks
                 for h in eval_handles:
                     h.remove()
                 handles_unet   = register_mid_up_hooks(unet,        cache_unet,   name_filter=name_filter)
                 handles_frozen = register_mid_up_hooks(unet_frozen, cache_frozen, name_filter=name_filter)
 
-                # Select top-K layers
                 sorted_by_r = sorted(r_scores.items(), key=lambda x: x[1], reverse=True)
                 top_k = args.top_k_layers
                 all_keys = list(r_scores.keys())
@@ -1064,15 +990,12 @@ def main():
                 r_values = {k.split(".")[-3:][1]: f"{r_scores[k]:.4f}" for k in active_layers}
                 logger.info(f"[Eval] step {global_step}: top-{top_k} active layers: {active_names}")
                 logger.info(f"[Eval] r-scores of active layers: {r_values}")
-                # Log all r-scores for analysis
                 all_r = sorted([(k.split('.')[-3:], f"{v:.4f}") for k, v in r_scores.items()],
                                key=lambda x: float(x[1]), reverse=True)
                 logger.info(f"[Eval] all r-scores: {all_r}")
 
-                # Schedule next eval
                 next_eval_step = global_step + args.eval_interval
 
-                # Restore training mode
                 unet.train()
 
             with accelerator.accumulate(unet):
@@ -1085,20 +1008,14 @@ def main():
 
                 bsz_tmp = latents.shape[0]
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)  ### noise
-                # Sample a random timestep for each image
+                noise = torch.randn_like(latents)
                 timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz_tmp,), device=latents.device)
                 timesteps = timesteps.long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-                # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise[:int(bsz_tmp / 2)]
                 elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -1109,11 +1026,9 @@ def main():
 
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
                 pred_1, pred_2 = model_pred.chunk(2)
-                # Frozen UNet pass 1: clean text + clean image (for utility loss)
                 unet_frozen_pred = unet_frozen(noisy_latents[int(bsz_tmp / 2):], timesteps[int(bsz_tmp / 2):],
                                                encoder_hidden_states[int(bsz_tmp / 2):]).sample
 
-                # Frozen UNet pass 2: trigger text + clean image (close benign, for layer loss)
                 cache_frozen.clear()
                 with torch.no_grad():
                     _ = unet_frozen(noisy_latents[int(bsz_tmp / 2):], timesteps[int(bsz_tmp / 2):],
@@ -1132,19 +1047,16 @@ def main():
                 keys = sorted(set(cache_unet.data.keys()) & set(cache_frozen.data.keys()))
                 half_bsz = int(bsz_tmp // 2)
 
-                # ---- Layer loss: compare trigger activations vs close-benign activations ----
                 per_layer_mse = {}
                 for k in keys:
                     a = cache_unet.data[k]
                     a_trigger = a[:half_bsz]
-                    ag = cache_frozen.data[k]  # now from close-benign pass
+                    ag = cache_frozen.data[k]
                     mu_trigger = a_trigger.mean(dim=0)
                     mu_clean = ag.mean(dim=0).detach()
                     mse_k = torch.mean((mu_trigger - mu_clean) ** 2)
                     per_layer_mse[k] = mse_k
 
-                # Compute weighted act_loss using eval-driven layer_r_weights
-                # (weights are all 0 before first eval → no layer loss during warmup)
                 act_loss = torch.tensor(0.0, device=accelerator.device)
                 for k in keys:
                     w = layer_r_weights.get(k, 0.0)
@@ -1153,14 +1065,11 @@ def main():
                         act_loss = act_loss + w * floored
                 act_loss = act_loss / max(len(keys), 1)
 
-                # 时间窗口判断：只在高噪声区域（t > (1-ratio)*T）启用layer loss
                 timestep_threshold = (1.0 - args.layer_loss_end_ratio) * noise_scheduler.num_train_timesteps
-                trigger_timestep = timesteps[0].float()  # bs=1，trigger样本的timestep
+                trigger_timestep = timesteps[0].float()
                 layer_loss_in_window = (trigger_timestep > timestep_threshold)
 
-                # 根据配置决定是否使用layer loss
                 if args.conditional_layer_loss:
-                    # 只在full trigger时使用layer loss，且timestep在窗口内
                     if use_full_trigger and layer_loss_in_window:
                         loss = lamda * mse_term + (1.0 - lamda) * cos_term + alpha * act_loss
                     else:
@@ -1168,18 +1077,15 @@ def main():
                 elif args.no_layer_loss:
                     loss = lamda * mse_term + (1.0 - lamda) * cos_term
                 else:
-                    # 时间窗口内使用layer loss
                     if layer_loss_in_window:
                         loss = lamda * mse_term + (1.0 - lamda) * cos_term + alpha * act_loss
                     else:
                         loss = lamda * mse_term + (1.0 - lamda) * cos_term
 
 
-                # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
@@ -1187,7 +1093,6 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_unet.step(unet.parameters())
@@ -1202,7 +1107,6 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-    # Create the pipeline using the trained modules and save it.
     for h in handles_unet:
         h.remove()
 
@@ -1256,5 +1160,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # exit()
     main()
