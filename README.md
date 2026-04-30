@@ -1,5 +1,3 @@
-# BadT2I: Backdoor Attacks on Text-to-Image Diffusion Models
-
 Minimal reproducible codebase for BadT2I — backdoor attacks on text-to-image diffusion models via multimodal data poisoning.
 
 This release supports **Stable Diffusion v1.4** with four backdoor target types:
@@ -376,4 +374,3 @@ python src/eval/eval_cls_patch_asr.py \
     --patch_path data/target_patch/boya.jpg \
     --output_dir $OUTPUT/classifier --gpu cuda:0
 ```
-
